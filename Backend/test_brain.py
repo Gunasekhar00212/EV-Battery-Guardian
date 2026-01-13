@@ -17,8 +17,9 @@ brain = EVGuardianBrain(
     model=model,
     scaler=scaler,
     charging_stations_km=[20, 55, 90],
-    safety_margin_km=10
+    user_mode="eco"        # try: eco / normal / aggressive
 )
+
 
 print("EV Guardian Brain initialized successfully")
 
