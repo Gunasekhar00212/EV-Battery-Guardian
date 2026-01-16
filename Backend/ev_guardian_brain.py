@@ -37,7 +37,8 @@ class EVGuardianBrain:
         scaler,
         charging_stations_km=None,
         user_mode="normal",
-        window_size=20
+        window_size=20,
+        safety_margin_km=10
     ):
         
 
