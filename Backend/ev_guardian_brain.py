@@ -130,6 +130,9 @@ class EVGuardianBrain:
         # 6️⃣ Estimate remaining range
         self.remaining_range_km = self._estimate_range()
 
+        self.recommended_station_km = self._find_reachable_station()
+
+
         # 7️⃣ Analyze charging stations
         next_station_distance = self._analyze_stations()
 
@@ -266,6 +269,95 @@ class EVGuardianBrain:
         # ---------------- SAFE ----------------
         self.alert_level = "SAFE"
         self.alert_message = "Battery level normal. Driving conditions safe."
+    def _generate_warning(self):
+
+        """
+            Convert alert level + internal state into human-like warnings
+        """
+
+        level = self.alert_level
+
+        if level == "SAFE":
+            return {
+                "warning_message": "Battery status is healthy. No action needed.",
+                "action_required": False,
+                "reason": "SOC and predicted range are within safe limits."
+            }
+
+        if level == "INFO":
+            return {
+                "warning_message": "Battery is slowly declining. Stay aware of upcoming charging options.",
+                "action_required": False,
+                "reason": "SOC trend shows gradual consumption."
+            }
+
+        if level == "WARNING":
+            return {
+                "warning_message": "Battery is dropping faster than expected. Plan to charge soon.",
+                "action_required": True,
+                "reason": "Predicted range is approaching safety margin."
+            }
+
+        if level == "CRITICAL":
+            if self.recommended_station_km is not None:
+                return {
+                    "warning_message": (
+                        f"Battery critically low. "
+                        f"Charge at the station in "
+                        f"{self.recommended_station_km - self.distance_travelled_km:.1f} km."
+                    ),
+                    "action_required": True,
+                    "reason": "This is the nearest reachable charging station."
+                }
+            else:
+                return {
+                    "warning_message": (
+                        "Battery critically low. No reachable charging stations ahead."
+                    ),
+                    "action_required": True,
+                    "reason": "Remaining range cannot safely reach any known station."
+                }
+
+
+        if level == "EMERGENCY":
+            return {
+                "warning_message": "Battery almost empty. Stop and charge immediately to avoid being stranded.",
+                "action_required": True,
+                "reason": "SOC has reached emergency threshold."
+            }
+
+        return {
+            "warning_message": "Battery status unknown.",
+            "action_required": False,
+            "reason": "Insufficient data."
+        }
+    def _find_reachable_station(self):
+        """
+        Decide which charging station is reachable and safest
+        """
+
+        if self.remaining_range_km is None:
+            return None
+
+        current_pos = self.distance_travelled_km
+        max_reach = current_pos + self.remaining_range_km - self.safety_margin_km
+
+        future_stations = [
+            s for s in self.charging_stations_km
+            if s > current_pos
+        ]
+
+        reachable = [
+            s for s in future_stations
+            if s <= max_reach
+        ]
+
+        if not reachable:
+            return None
+
+        # Choose nearest reachable station
+        return min(reachable)
+
 
     def get_status(self):
         return {
@@ -276,5 +368,16 @@ class EVGuardianBrain:
             "alert_level": self.alert_level,
             "alert_message": self.alert_message,
             "recommended_station_km": self.recommended_station_km,
-            "recommendation_active": self.recommendation_active
+            "recommendation_active": self.recommendation_active,
+            
+            # NEW FIELDS
+            "warning_message": warning["warning_message"],
+            "action_required": warning["action_required"],
+            "reason": warning["reason"],
+            "recommended_station_km": self.recommended_station_km,
+            "distance_to_station_km": (
+                self.recommended_station_km - self.distance_travelled_km
+                if self.recommended_station_km is not None else None
+            ),
+
         }
