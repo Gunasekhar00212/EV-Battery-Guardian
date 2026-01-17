@@ -160,7 +160,12 @@ class EVGuardianBrain:
         X = X.reshape(1, self.window_size, 5)
     
         try:
-            predicted_soc_scaled = self.model.predict(X, verbose=0)[0][0]
+            pred = self.model.predict(X, verbose=0)
+            
+            if pred is None:
+                return self.current_soc
+            
+            predicted_soc_scaled = float(np.ravel(pred)[0])
         except Exception:
             # fail-safe: never crash the system
             return self.current_soc
@@ -177,23 +182,33 @@ class EVGuardianBrain:
     # -------------------------------------------------
 
     def _estimate_range(self):
-        """
-        Estimate remaining range from SOC trend
-        """
+        try:
+            if self.predicted_soc is None or self.current_soc is None:
+                return None
 
-        soc_drop = self.current_soc - self.predicted_soc
+            soc_drop = self.current_soc - self.predicted_soc
 
-        if soc_drop <= 0:
-            return float("inf")
+            if soc_drop <= 0:
+                return None
 
-        # SOC drop per km (using recent movement)
-        drain_per_km = soc_drop / max(
-            (self.distance_travelled_km / max(len(self.feature_window), 1)),
-            0.001
-        )
+            if self.distance_travelled_km <= 0:
+                return None
 
-        remaining_range = self.current_soc / drain_per_km
-        return max(0.0, remaining_range)
+            drain_per_km = soc_drop / self.distance_travelled_km
+
+            if not np.isfinite(drain_per_km) or drain_per_km <= 0:
+                return None
+
+            remaining_range = self.current_soc / drain_per_km
+
+            if not np.isfinite(remaining_range):
+                return None
+
+            return float(max(0.0, remaining_range))
+
+        except Exception:
+            return None
+
 
     # -------------------------------------------------
 
@@ -216,7 +231,11 @@ class EVGuardianBrain:
 
         # estimate time-to-empty (minutes)
         if self.remaining_range_km not in [None, float("inf")]:
-            avg_speed = max(10, np.mean([f[0] for f in self.feature_window]))
+            try:
+                avg_speed = max(10, abs(np.mean([f[0] for f in self.feature_window])))
+            except Exception:
+                avg_speed = 10
+
             time_to_empty = (self.remaining_range_km / avg_speed) * 60
         else:
             time_to_empty = None
@@ -360,24 +379,25 @@ class EVGuardianBrain:
 
 
     def get_status(self):
+        warning = self._generate_warning()
+
         return {
             "current_soc": self.current_soc,
             "predicted_soc": self.predicted_soc,
             "remaining_range_km": self.remaining_range_km,
             "distance_travelled_km": self.distance_travelled_km,
+
             "alert_level": self.alert_level,
             "alert_message": self.alert_message,
-            "recommended_station_km": self.recommended_station_km,
-            "recommendation_active": self.recommendation_active,
-            
-            # NEW FIELDS
+
             "warning_message": warning["warning_message"],
             "action_required": warning["action_required"],
             "reason": warning["reason"],
+
             "recommended_station_km": self.recommended_station_km,
             "distance_to_station_km": (
                 self.recommended_station_km - self.distance_travelled_km
                 if self.recommended_station_km is not None else None
-            ),
-
+            )
         }
+
