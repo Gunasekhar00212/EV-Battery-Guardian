@@ -1,7 +1,9 @@
-from pyexpat import features
 import numpy as np
 from collections import deque
 import pandas as pd
+from backend.utils.geo import haversine_distance
+from backend.utils.geo import estimate_road_distance_km
+from backend.utils.charging_api import fetch_nearby_charging_stations
 
 USER_MODES = {
     "eco": {
@@ -35,10 +37,11 @@ class EVGuardianBrain:
         self,
         model,
         scaler,
-        charging_stations_km=None,
+        charging_stations=None,
         user_mode="normal",
         window_size=20,
         safety_margin_km=10
+        
     ):
         
 
@@ -55,12 +58,14 @@ class EVGuardianBrain:
         self.mode_cfg = USER_MODES[user_mode]
 
         # --- Route / station knowledge ---
-        self.charging_stations_km = charging_stations_km or []
+        self.charging_stations= charging_stations or []
         self.safety_margin_km = self.mode_cfg["safety_margin_km"]
 
         # --- Internal state (memory) ---
         self.feature_window = deque(maxlen=window_size)
         self.distance_travelled_km = 0.0
+
+        
 
         # --- Runtime state ---
         self.current_soc = None
@@ -68,7 +73,7 @@ class EVGuardianBrain:
         self.remaining_range_km = None
         self.alert_level = "SAFE"
         self.alert_message = ""
-        # --- Recommendation state ---
+        # # --- Recommendation state ---
         self.recommended_station_km = None
         self.recommendation_active = False
 
@@ -83,17 +88,28 @@ class EVGuardianBrain:
         current_soc,
         battery_current,
         battery_voltage,
-        battery_temp
+        battery_temp,
+        current_lat=None,
+        current_lon=None
     ):
+        self.current_lat=current_lat
+        self.current_lon=current_lon
+
+        self.current_soc = current_soc
+        
+        
+
+
         """
         One brain update step (e.g., 1 second)
         """
+        self.full_battery_range_km = 300.0  # realistic default EV range
 
         # 1️⃣ Update distance
         distance_step = (speed_kmph * dt_sec) / 3600.0
         self.distance_travelled_km += distance_step
 
-        self.current_soc = current_soc
+        
 
         # 2️⃣ Build feature vector (ORDER MUST MATCH TRAINING)
         features = [
@@ -114,7 +130,10 @@ class EVGuardianBrain:
                 'SoC [%]'
             ]
         )
-        scaled_features = self.scaler.transform(df_features)[0]
+        if df_features.shape[1] != self.scaler.n_features_in_:
+            return self.get_status()
+        # 3️⃣ Scale features
+        scaled_features = self.scaler.transform(df_features.values)[0]
         # safety check
         if not np.isfinite(scaled_features).all():
             return self.get_status()
@@ -128,9 +147,12 @@ class EVGuardianBrain:
         self.predicted_soc = self._predict_soc()
 
         # 6️⃣ Estimate remaining range
-        self.remaining_range_km = self._estimate_range()
+        station, distance_km = self._find_reachable_station()
 
-        self.recommended_station_km = self._find_reachable_station()
+        self.recommended_station_km = distance_km
+        self.recommendation_active = station is not None
+        self.recommended_station = station
+
 
 
         # 7️⃣ Analyze charging stations
@@ -138,6 +160,9 @@ class EVGuardianBrain:
 
         # 8️⃣ Decide alert
         self._decide_alert(next_station_distance)
+        
+
+
 
         return self.get_status()
 
@@ -161,10 +186,10 @@ class EVGuardianBrain:
     
         try:
             pred = self.model.predict(X, verbose=0)
-            
-            if pred is None:
+    
+            if pred is None:    
                 return self.current_soc
-            
+    
             predicted_soc_scaled = float(np.ravel(pred)[0])
         except Exception:
             # fail-safe: never crash the system
@@ -175,8 +200,13 @@ class EVGuardianBrain:
         soc_max = self.scaler.data_max_[-1]
     
         predicted_soc = predicted_soc_scaled * (soc_max - soc_min) + soc_min
+        predicted_soc = float(np.clip(predicted_soc, 0.0, 1.0))
     
-        return float(np.clip(predicted_soc, 0.0, 1.0))
+        # 🔒 Physics-aware soft constraint
+        predicted_soc = min(predicted_soc, self.current_soc - 0.0001)
+    
+        return predicted_soc
+
     
 
     # -------------------------------------------------
@@ -214,16 +244,35 @@ class EVGuardianBrain:
 
     def _analyze_stations(self):
         """
-        Route-based station analysis
+        Fetch real charging stations and find nearest distance
         """
+        if self.current_lat is None or self.current_lon is None:
+            return None
 
-        for station_km in self.charging_stations_km:
-            if station_km > self.distance_travelled_km:
-                return station_km - self.distance_travelled_km
+        stations = fetch_nearby_charging_stations(
+            self.current_lat,
+            self.current_lon,
+            radius_km=20
+        )
 
-        return None
+        if not stations:
+            return None
 
-    # -------------------------------------------------
+        nearest_distance = None
+
+        for station in stations:
+            dist = haversine_distance(
+                self.current_lat,
+                self.current_lon,
+                station["lat"],
+                station["lon"]
+            )
+
+            if nearest_distance is None or dist < nearest_distance:
+                nearest_distance = dist
+
+        return nearest_distance
+            # -------------------------------------------------
 
     def _decide_alert(self, next_station_distance):
         soc = self.current_soc
@@ -351,31 +400,40 @@ class EVGuardianBrain:
             "reason": "Insufficient data."
         }
     def _find_reachable_station(self):
-        """
-        Decide which charging station is reachable and safest
-        """
+        if self.current_lat is None or self.current_lon is None:
+            return None, None
 
-        if self.remaining_range_km is None:
-            return None
+        remaining_range_km = self._estimate_remaining_range()
+        if remaining_range_km is None:
+            return None, None
 
-        current_pos = self.distance_travelled_km
-        max_reach = current_pos + self.remaining_range_km - self.safety_margin_km
+        reachable = []
 
-        future_stations = [
-            s for s in self.charging_stations_km
-            if s > current_pos
-        ]
+        for station in self.charging_stations:
+            road_distance_km = estimate_road_distance_km(
+                self.current_lat,
+                self.current_lon,
+                station["lat"],
+                station["lon"]
+            )
 
-        reachable = [
-            s for s in future_stations
-            if s <= max_reach
-        ]
+            if remaining_range_km >= road_distance_km + self.safety_margin_km:
+                reachable.append((station, road_distance_km))
 
         if not reachable:
-            return None
+            return None, None
 
-        # Choose nearest reachable station
-        return min(reachable)
+        best_station, best_distance = min(reachable, key=lambda x: x[1])
+        return best_station, best_distance
+
+
+        
+    # -------------------------------------------------
+    def _estimate_remaining_range(self):
+        if self.current_soc is None:
+            return None
+        return round(self.current_soc * self.full_battery_range_km, 2)
+
 
 
     def get_status(self):
@@ -384,7 +442,7 @@ class EVGuardianBrain:
         return {
             "current_soc": self.current_soc,
             "predicted_soc": self.predicted_soc,
-            "remaining_range_km": self.remaining_range_km,
+            "remaining_range_km": self._estimate_remaining_range(),
             "distance_travelled_km": self.distance_travelled_km,
 
             "alert_level": self.alert_level,

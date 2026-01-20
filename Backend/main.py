@@ -8,12 +8,13 @@ import joblib
 model = load_model("backend/models/ev_soc_lstm_model.keras", compile=False)
 scaler= joblib.load("backend/models/ev_feature_scaler.pkl")
 
+
 brain = EVGuardianBrain(
     model=model,
     scaler=scaler,
-    charging_stations_km=[20,55,90],
     safety_margin_km=10
 )
+
 
 class EVinput(BaseModel):
     speed:float
@@ -38,6 +39,10 @@ class StepInput(BaseModel):
     battery_temp:float
     dt_sec:float = 1.0
 
+    current_lat: float | None = None
+    current_lon: float | None = None
+
+
 
 
 app =  FastAPI()
@@ -49,12 +54,14 @@ def step_ev(data: StepInput):
         current_soc=data.current_soc,
         battery_current=data.battery_current,
         battery_voltage=data.battery_voltage,
-        battery_temp=data.battery_temp
+        battery_temp=data.battery_temp,
+        current_lat=data.current_lat,
+        current_lon=data.current_lon
 
     )
     return status
 
-@app.post("/warn")
+"""@app.post("/warn")
 def warning_logic(
     predicted_range_km: float,
     nearest_station_km: float,
@@ -118,7 +125,9 @@ def full_analysis(
         warning=warning,
         warning_reason=reason,
         recommended_stations=reachable
+
     )
+  """
 import time
 
 @app.post("/simulate-drive")
@@ -151,7 +160,9 @@ def simulate_drive(
             current_soc=soc,
             battery_current=battery_current,
             battery_voltage=390,
-            battery_temp=25
+            battery_temp=25,
+            current_lat=17.3850 + t * 0.00001,
+            current_lon=78.4867 + t * 0.00001
         )
 
         # simulate real SOC drain (ground truth)
